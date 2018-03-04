@@ -38,9 +38,15 @@ import os
 
 import tensorflow as tf
 import horovod.tensorflow as hvd
+import variable_mgr
+import variable_mgr_util
 
 _BATCH_NORM_DECAY = 0.997
 _BATCH_NORM_EPSILON = 1e-5
+
+use_vb = False
+fjr_init_lr_fix = False
+fjr_use_gradient = True
 
 
 ################################################################################
@@ -67,7 +73,6 @@ def process_record_dataset(dataset, is_training, batch_size, shuffle_buffer,
   Returns:
     Dataset of (image, label) pairs ready for iteration.
   """
-  # We prefetch a batch at a time, This can help smooth out the time taken to
   # load input files as we go through shuffling and processing.
   dataset = dataset.prefetch(buffer_size=batch_size)
   if is_training:
@@ -83,7 +88,12 @@ def process_record_dataset(dataset, is_training, batch_size, shuffle_buffer,
   dataset = dataset.map(lambda value: parse_record_fn(value, is_training),
                         num_parallel_calls=num_parallel_calls)
 
-  dataset = dataset.batch(batch_size)
+  #fjr for VBN
+  if(use_vb == True):
+    dataset = dataset.apply(tf.contrib.data.batch_and_drop_remainder(batch_size))
+  else:
+    dataset = dataset.batch(batch_size)
+  # We prefetch a batch at a time, This can help smooth out the time taken to
 
   # Operations between the final prefetch and the get_next call to the iterator
   # will happen synchronously during run time. We prefetch here again to
@@ -101,10 +111,17 @@ def batch_norm_relu(inputs, training, data_format):
   """Performs a batch normalization followed by a ReLU."""
   # We set fused=True for a significant performance boost. See
   # https://www.tensorflow.org/performance/performance_guide#common_fused_ops
+  #fjr vb
+  if(use_vb == True):
+    vb = 128;
+  else:
+    vb=None
   inputs = tf.layers.batch_normalization(
       inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
       momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
-      scale=True, training=training, fused=True)
+      scale=True, training=training, fused=True,
+      virtual_batch_size=vb)
+      #fjr add for r1.5
   inputs = tf.nn.relu(inputs)
   return inputs
 
@@ -403,13 +420,19 @@ def learning_rate_with_decay(
     trained so far (global_step)- and returns the learning rate to be used
     for training the next batch.
   """
-  initial_learning_rate = 0.1 * batch_size * hvd.size() / batch_denom
+  # fjr test
+  if(fjr_init_lr_fix == True):
+    initial_learning_rate = 0.1
+  else:
+    initial_learning_rate = (0.1 * batch_size * hvd.size() / batch_denom) ** 0.5
+
   batches_per_epoch = num_images / batch_size / hvd.size()
 
   # Multiply the learning rate by 0.1 at 100, 150, and 200 epochs.
   boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
   vals = [initial_learning_rate * decay for decay in decay_rates]
 
+   # fjr add warm-up for B > 2048
   def learning_rate_fn(global_step):
     global_step = tf.cast(global_step, tf.int32)
     if batch_size * hvd.size() <= 2048:
@@ -427,7 +450,7 @@ def learning_rate_with_decay(
 
 def resnet_model_fn(features, labels, mode, model_class,
                     resnet_size, weight_decay, learning_rate_fn, momentum,
-                    data_format, loss_filter_fn=None):
+                    data_format, loss_filter_fn=None, batch_size = None, lars_scale = 0.001):
   """Shared functionality for different resnet model_fns.
 
   Initializes the ResnetModel representing the model layers
@@ -502,15 +525,46 @@ def resnet_model_fn(features, labels, mode, model_class,
     tf.identity(learning_rate, name='learning_rate')
     tf.summary.scalar('learning_rate', learning_rate)
 
+    #fjr add batch size
+    if(batch_size != None):
+      log_batch_size = tf.constant(batch_size, dtype=tf.int32,  name='batch_size')
+      tf.summary.scalar('batch_size', log_batch_size)
+
     optimizer = tf.train.MomentumOptimizer(
         learning_rate=learning_rate,
         momentum=momentum)
     optimizer = hvd.DistributedOptimizer(optimizer)
 
-    # Batch norm requires update ops to be added as a dependency to train_op
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-    with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(loss, global_step)
+    if(fjr_use_gradient == True):
+        #fjr add grad processing
+        # 1. get trainable_variables parms
+        grads_and_vars = optimizer.compute_gradients(loss, tf.trainable_variables())
+        #grads_to_vars = [tf.norm(gv[1]) / (tf.norm(gv[0]) + weight_decay * tf.norm(gv[1])) 
+        #        for gv in grads_and_vars]
+        #tf.summary.histogram("grads_to_vars", grads_to_vars)
+
+        new_grads = []
+        new_vars = []
+        for g, v in grads_and_vars:
+            norm_scalar = tf.norm(v) / (tf.norm(g) + weight_decay * tf.norm(v))
+            tf.summary.scalar("vg/" + v.op.name, norm_scalar)
+            if 'batch_normalization' not in v.op.name:
+                g = norm_scalar * lars_scale * g
+            new_grads.append(g)
+            new_vars.append(v)
+        new_grads_and_vars = list(zip(new_grads, new_vars))
+        # 2. do sth with gradients
+        # Batch norm requires update ops to be added as a dependency to train_op
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(update_ops):
+          #train_op = optimizer.minimize(loss, global_step)
+          #3. apply the processed gradients
+          train_op = optimizer.apply_gradients(new_grads_and_vars, global_step)
+    else:
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(update_ops):
+          train_op = optimizer.minimize(loss, global_step)
+
   else:
     train_op = None
 
@@ -548,13 +602,15 @@ def resnet_main(flags, model_function, input_function):
           'resnet_size': flags.resnet_size,
           'data_format': flags.data_format,
           'batch_size': flags.batch_size,
+          'lars_scale': flags.lars_scale
       })
 
-  for _ in range(flags.train_epochs // hvd.size() // flags.epochs_per_eval):
+  for global_epoch in range(flags.train_epochs // hvd.size() // flags.epochs_per_eval):
     tensors_to_log = {
         'learning_rate': 'learning_rate',
         'cross_entropy': 'cross_entropy',
-        'train_accuracy': 'train_accuracy'
+        'train_accuracy': 'train_accuracy',
+        'batch_size': 'batch_size'
     }
 
     logging_hook = tf.train.LoggingTensorHook(
@@ -563,9 +619,24 @@ def resnet_main(flags, model_function, input_function):
 
     print('Starting a training cycle.')
 
+    #fjr increase batch size
+    #if(global_epoch == 100 // hvd.size()):
+    #  flags.batch_size = flags.batch_size // 4;
     def input_fn_train():
       return input_function(True, flags.data_dir, flags.batch_size,
                             flags.epochs_per_eval, flags.num_parallel_calls)
+    print('batch_size', flags.batch_size)
+
+    # if(global_epoch == 80 // hvd.size()):
+    #   flags.batch_size = flags.batch_size / 4;
+    # elif(global_epoch == 100 // hvd.size()):
+    #   flags.batch_size = flags.batch_size * 4;
+    # elif(global_epoch == 130 // hvd.size()):
+    #   flags.batch_size = flags.batch_size / 4;
+    # elif(global_epoch == 150 // hvd.size()):
+    #   flags.batch_size = flags.batch_size * 4;
+    # elif(global_epoch == 180 // hvd.size()):
+    #   flags.batch_size = flags.batch_size / 4;
 
     classifier.train(input_fn=input_fn_train, hooks=[logging_hook, bcast_hook])
 
@@ -573,7 +644,7 @@ def resnet_main(flags, model_function, input_function):
     # Evaluate the model and print results
     def input_fn_eval():
       # fjr set batch size as 100 for large batch
-      return input_function(False, flags.data_dir, 100,
+      return input_function(False, flags.data_dir, 128,
                             1, flags.num_parallel_calls)
 
     eval_results = classifier.evaluate(input_fn=input_fn_eval)
@@ -626,3 +697,7 @@ class ResnetArgParser(argparse.ArgumentParser):
              'is not always compatible with CPU. If left unspecified, '
              'the data format will be chosen automatically based on '
              'whether TensorFlow was built for CPU or GPU.')
+
+    self.add_argument(
+        '--lars_scale', type=float, default=10.0,
+        help='for lare')

@@ -171,6 +171,18 @@ def cifar10_model_fn(features, labels, mode, params):
       num_images=_NUM_IMAGES['train'], boundary_epochs=[100, 150, 200],
       decay_rates=[1, 0.1, 0.01, 0.001])
 
+  # fjr for increase batch size do not decay lr at 100th epoch
+  #learning_rate_fn = resnet.learning_rate_with_decay(
+  #    batch_size=params['batch_size'], batch_denom=128,
+  #    num_images=_NUM_IMAGES['train'], boundary_epochs=[80, 100, 130, 150, 180, 200],
+  #    decay_rates=[1, 1/4, 0.1, 1/4*0.1, 0.01, 1/4*0.001, 1/4*0.0001])
+
+  # fjr for increase batch size do not decay lr at 100th epoch
+  # learning_rate_fn = resnet.learning_rate_with_decay(
+  #     batch_size=params['batch_size'], batch_denom=128,
+  #     num_images=_NUM_IMAGES['train'], boundary_epochs=[100, 150, 200],
+  #     decay_rates=[1, 0.1/4, 0.01 / 4, 0.001])
+
   # We use a weight decay of 0.0002, which performs better
   # than the 0.0001 that was originally suggested.
   weight_decay = 2e-4
@@ -189,7 +201,8 @@ def cifar10_model_fn(features, labels, mode, params):
                                 learning_rate_fn=learning_rate_fn,
                                 momentum=0.9,
                                 data_format=params['data_format'],
-                                loss_filter_fn=loss_filter_fn)
+                                loss_filter_fn=loss_filter_fn,
+                                lars_scale = params['lars_scale'])
 
 
 def main(unused_argv):
